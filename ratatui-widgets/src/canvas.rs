@@ -106,6 +106,7 @@ trait Grid: fmt::Debug {
     /// The point is expressed in number of dots starting at the origin of the grid in the top left
     /// corner. Note that this is not the same as the `(x, y)` coordinates of the canvas.
     fn paint(&mut self, x: usize, y: usize, color: Color);
+    fn line_run(&mut self, x0: usize, x1: usize, y: usize, color: Color);
     /// Save the current state of the [`Grid`] as a layer to be rendered
     fn save(&self) -> Layer;
     /// Reset the grid to its initial state
@@ -219,6 +220,54 @@ impl<const W: usize, const H: usize> Grid for PatternGrid<W, H> {
             cell.color = Some(color);
         }
     }
+
+    fn line_run(&mut self, x0: usize, x1: usize, y: usize, color: Color) {
+        if x0 > x1 {
+            return;
+        }
+
+        // 1. Standard math replaces saturating math.
+        // (Assuming x0, x1, and y are pre-clipped or validated by game logic)
+        let row = y.saturating_div(H).saturating_mul(self.width as usize);
+
+        let start_col = x0.saturating_div(W);
+        let end_col = x1.saturating_div(W);
+
+        let index0 = row + start_col;
+        let index1 = row + end_col;
+
+        if let Some(cells) = self.cells.get_mut(index0..=index1) {
+            // 2. Hoist the loop invariant! We only calculate this once per line.
+            let y_shift = W * (y % H);
+
+            let mut current_x = x0;
+
+            for (i, cell) in cells.iter_mut().enumerate() {
+                // Find where our line exits this specific cell
+                let current_col = start_col + i;
+                let next_cell_start_x = (current_col + 1) * W;
+                let end_x = x1.min(next_cell_start_x - 1);
+
+                // 3. The Bitmask Trick (O(1) instead of O(W))
+                let start_local = current_x % W;
+                let end_local = end_x % W;
+                let n_bits = end_local - start_local + 1;
+
+                // Create a block of 1s 'n_bits' wide, and shift it to the starting X position
+                // We use 1u16 to prevent overflow panics if n_bits ever equals 8
+                let local_mask = ((1u16 << n_bits) - 1) << start_local;
+
+                // Shift to the correct Y row and cast back to a byte
+                let mask = (local_mask << y_shift) as u8;
+
+                cell.pattern |= mask;
+                cell.color = Some(color);
+
+                // Move our tracker to the start of the next cell
+                current_x = end_x + 1;
+            }
+        }
+    }
 }
 
 /// The `CharGrid` is a grid made up of cells each containing a single character.
@@ -294,6 +343,20 @@ impl Grid for CharGrid {
         // and we want to make sure we don't panic if the index is out of bounds
         if let Some(c) = self.cells.get_mut(index) {
             *c = Some(color);
+        }
+    }
+
+    fn line_run(&mut self, x0: usize, x1: usize, y: usize, color: Color) {
+        if x0 > x1 {
+            return;
+        }
+
+        let row = y.saturating_mul(self.width as usize);
+
+        let index0 = row.saturating_add(x0);
+        let index1 = row.saturating_add(x1);
+        if let Some(c) = self.cells.get_mut(index0..=index1) {
+            c.iter_mut().for_each(|c| *c = Some(color));
         }
     }
 }
@@ -395,6 +458,16 @@ impl Grid for HalfBlockGrid {
     fn paint(&mut self, x: usize, y: usize, color: Color) {
         self.pixels[y][x] = Some(color);
     }
+
+    fn line_run(&mut self, x0: usize, x1: usize, y: usize, color: Color) {
+        if x0 > x1 {
+            return;
+        }
+
+        self.pixels[y][x0..=x1]
+            .iter_mut()
+            .for_each(|p| *p = Some(color));
+    }
 }
 
 /// Painter is an abstraction over the [`Context`] that allows to draw shapes on the grid.
@@ -404,7 +477,7 @@ impl Grid for HalfBlockGrid {
 #[derive(Debug)]
 pub struct Painter<'a, 'b> {
     context: &'a mut Context<'b>,
-    resolution: (f64, f64),
+    scales: Option<(f64, f64)>,
 }
 
 impl Painter<'_, '_> {
@@ -454,14 +527,30 @@ impl Painter<'_, '_> {
         if !x.is_finite() || !y.is_finite() || x < left || x > right || y < bottom || y > top {
             return None;
         }
-        let width = right - left;
-        let height = top - bottom;
-        if width <= 0.0 || height <= 0.0 {
+        let scales = self.scales?;
+        let x = ((x - left) * scales.0 + 0.5) as usize;
+        let y = ((top - y) * scales.1 + 0.5) as usize;
+        Some((x, y))
+    }
+
+    /// Convert the `(x0, x1, y)` coordinates to a run of pixels on the grid.
+    /// 
+    /// `(x, y)` coordinates are expressed in the coordinate system of the canvas (see [`Painter::get_point()`]).
+    /// The grid coordinates are expressed in the coordinate system of the grid (see [`Painter::get_point()`]).
+    /// 
+    /// Points are rounded to the nearest grid cell (with points exactly in the center of a cell
+    /// rounding up).
+    pub fn get_line_run(&self, x0: f64, x1: f64, y: f64) -> Option<(usize, usize, usize)> {
+        let [left, right] = self.context.x_bounds;
+        let [bottom, top] = self.context.y_bounds;
+        if x1 < left || x0 > right || y < bottom || y > top {
             return None;
         }
-        let x = ((x - left) * (self.resolution.0 - 1.0) / width).round() as usize;
-        let y = ((top - y) * (self.resolution.1 - 1.0) / height).round() as usize;
-        Some((x, y))
+        let scales = self.scales?;
+        let x0 = ((x0.max(left) - left) * scales.0 + 0.5) as usize;
+        let x1 = ((x1.min(right) - left) * scales.0 + 0.5) as usize;
+        let y = ((top - y) * scales.1 + 0.5) as usize;
+        Some((x0, x1, y))
     }
 
     /// Paint a point of the grid
@@ -479,6 +568,27 @@ impl Painter<'_, '_> {
     /// ```
     pub fn paint(&mut self, x: usize, y: usize, color: Color) {
         self.context.grid.paint(x, y, color);
+    }
+
+    /// Paint a run of pixels on the grid. Prefer this function over making
+    /// the equivalent calls to [`Painter::paint()`]
+    /// 
+    /// ```
+    /// use ratatui::style::Color;
+    /// use ratatui::symbols;
+    /// use ratatui::widgets::canvas::{Context, Painter};
+    /// 
+    /// let mut ctx = Context::new(19, 19, [0.0, 20.0], [0.0, 20.0], symbols::Marker::Braille);
+    /// let mut painter = Painter::from(&mut ctx);
+    /// 
+    /// let x0 = 1;
+    /// let x1 = 15;
+    /// let y = 10;
+    /// 
+    /// (x0..=x1).for_each(|x| painter.paint(x, y, Color::Red));
+    /// ```
+    pub fn line_run(&mut self, x0: usize, x1: usize, y: usize, color: Color) {
+        self.context.grid.line_run(x0, x1, y, color);
     }
 
     /// Canvas context bounds by axis.
@@ -502,9 +612,14 @@ impl Painter<'_, '_> {
 impl<'a, 'b> From<&'a mut Context<'b>> for Painter<'a, 'b> {
     fn from(context: &'a mut Context<'b>) -> Self {
         let resolution = context.grid.resolution();
+        let [left, right] = context.x_bounds;
+        let [bottom, top] = context.y_bounds;
+        let width = right - left;
+        let height = top - bottom;
+        let scales = ((resolution.0 - 1.0) / width, (resolution.1 - 1.0) / height);
         Self {
             context,
-            resolution,
+            scales: (width > 0.0 && height > 0.0).then_some(scales),
         }
     }
 }
